@@ -7,12 +7,22 @@ import simul.cnv.gene_expression as gex
 import simul.base.splatter as splatter
 
 from simul.patients.dataset import Dataset
-from simul.base.config import SimCellConfig
+from simul.base.config import Bridges, SimCellConfig
+import simul.base.utils as utils
 
 import os
 import pathlib as pl
 import json
 import anndata as ad
+
+from scipy.interpolate import CubicSpline
+from scipy.stats import norm
+from simul.base.config import Proportions
+
+from sympy import symbols, Eq, solve
+from simul.base.config import CoefficientCache
+
+from scipy.stats import beta
 
 ######## SAVING FUNCTIONS ##############
 
@@ -203,3 +213,358 @@ def transform_malignant_means(
         cnv_transf_means[patient] = new_means
 
     return cnv_transf_means, gain_expr_full, loss_expr_full
+
+######### Assignement of cell cycle phase to cells ############
+def assign_cycle_phases(
+    config: SimCellConfig,
+    full_obs: Dict[str, pd.DataFrame],
+) -> Tuple[Dict[str, np.ndarray]]:
+    """Assign a cell cycle phase to each cell in the dataset.
+    Cells are filtered by cell type and then assigned a phase based on the proportions of the cell type.
+
+    Args:
+    config (SimCellConfig): The configuration of the simulation.
+    full_obs (Dict[str, pd.DataFrame]): The DataFrame containing the cells.
+
+    Returns:
+    Dict[str, np.ndarray]: The DataFrame containing the cells with the assigned cell cycle phase.
+    """
+    
+    for patient in full_obs:
+        df_obs = full_obs[patient].copy()
+        original_order = df_obs.index
+        celltypes = config.group_names
+        masks = [(df_obs.program == celltype).ravel() for celltype in celltypes]
+
+        df_obs_filtered = [df_obs.loc[mask] for mask in masks]
+        df_obs_with_phases = map(lambda df, celltype: df.assign(cell_phase=assign_phases(df, celltype, config.cell_cycle_proportions)), 
+                                 df_obs_filtered, celltypes)
+        
+        df_obs_with_cycle_phases = pd.concat(df_obs_with_phases)
+        df_obs_with_cycle_phases = df_obs_with_cycle_phases.reindex(original_order)
+        full_obs[patient] = df_obs_with_cycle_phases
+
+    return full_obs
+
+def assign_phases(df: pd.DataFrame, program: str, proportions_config: Proportions) -> np.ndarray:
+    program_proportions = proportions_config.get_proportion(program)
+    phases = list(program_proportions.keys())
+    probabilities = list(program_proportions.values())
+    cell_phases = np.random.choice(phases, size=len(df), p=probabilities)
+    return cell_phases
+
+######### Transforming mean linked to phase ############
+def transform_phase_means(
+    phase: str,
+    full_obs: Dict[str, pd.DataFrame],
+    marker_genes: pd.DataFrame,
+    transformed_means: Dict[str, pd.DataFrame],
+    bridge_params: Bridges,
+) -> Dict[str, pd.DataFrame]:
+
+    phase_transf_means = {pat: [] for pat in full_obs}
+
+    num_s_genes = marker_genes['S'].sum()
+    num_g2m_genes = marker_genes['G2M'].sum()
+    num_identity_genes = len(marker_genes) - (num_s_genes + num_g2m_genes)
+
+    if phase == 'G1':
+        bridge_params_dict = {
+            'phase' : phase,
+            'S_marker_genes': bridge_params.G1_phase_S_genes,
+            'G2M_marker_genes': bridge_params.G1_phase_G2M_genes,
+            'identity_genes': bridge_params.G1_phase_identity_genes,
+            'num_S_genes': num_s_genes,
+            'num_G2M_genes': num_g2m_genes,
+            'num_identity_genes': num_identity_genes
+        }
+        
+    elif phase == 'S':
+        bridge_params_dict = {
+            'phase' : phase,
+            'S_marker_genes': bridge_params.S_phase_S_genes,
+            'G2M_marker_genes': bridge_params.S_phase_G2M_genes,
+            'identity_genes': bridge_params.S_phase_identity_genes,
+            'num_S_genes': num_s_genes,
+            'num_G2M_genes': num_g2m_genes,
+            'num_identity_genes': num_identity_genes
+        }
+    elif phase == 'G2M':
+        bridge_params_dict = {
+            'phase' : phase,
+            'S_marker_genes': bridge_params.G2M_phase_S_genes,
+            'G2M_marker_genes': bridge_params.G2M_phase_G2M_genes,
+            'identity_genes': bridge_params.G2M_phase_identity_genes,
+            'num_S_genes': num_s_genes,
+            'num_G2M_genes': num_g2m_genes,
+            'num_identity_genes': num_identity_genes
+        }
+
+    S_bridges, G2M_bridges, identity_bridges = generate_bridges(bridge_params_dict)
+    phase_transf_means = adjust_means_by_phase(
+        phase, 
+        full_obs, 
+        transformed_means, 
+        marker_genes, 
+        S_bridges,
+        G2M_bridges,
+        identity_bridges
+    )
+
+    return phase_transf_means
+
+def generate_bridges(bridge_params_dict: dict) -> Tuple[np.ndarray]:
+    S_bridges = {}
+    G2M_bridges = {}
+    identity_bridges = {}
+
+    phase = bridge_params_dict['phase']
+
+    if phase == 'G1':
+        S_bridges = generate_combined_bridges(bridge_params_dict, 'num_S_genes', 'S_marker_genes', True)
+        G2M_bridges = generate_combined_bridges(bridge_params_dict, 'num_G2M_genes', 'G2M_marker_genes', False)
+        identity_bridges = generate_simple_bridges(bridge_params_dict, 'num_identity_genes', 'identity_genes')
+    
+    elif phase == 'S':
+        S_bridges = generate_simple_bridges(bridge_params_dict, 'num_S_genes', 'S_marker_genes')
+        G2M_bridges = generate_combined_bridges(bridge_params_dict, 'num_G2M_genes', 'G2M_marker_genes', True)
+        identity_bridges = generate_simple_bridges(bridge_params_dict, 'num_identity_genes', 'identity_genes')
+
+    elif phase == 'G2M':
+        S_bridges = generate_combined_bridges(bridge_params_dict, 'num_S_genes', 'S_marker_genes', False)
+        G2M_bridges = generate_simple_bridges(bridge_params_dict, 'num_G2M_genes', 'G2M_marker_genes')
+        identity_bridges = generate_simple_bridges(bridge_params_dict, 'num_identity_genes', 'identity_genes')
+
+    return S_bridges, G2M_bridges, identity_bridges
+
+def generate_simple_bridges(bridge_params_dict: dict, num_genes: str, genes: str) -> np.ndarray:
+    simple_bridges = utils.generate_valid_bridges(
+        bridge_params_dict[num_genes], 
+        bridge_params_dict[genes].start_range, 
+        bridge_params_dict[genes].end_range, 
+        bridge_params_dict[genes].sigma_range, 
+        bridge_params_dict[genes].upregulation_bridge)
+    return simple_bridges
+
+def generate_combined_bridges(bridge_params_dict: dict, num_genes: str, genes: str, upregulation_bridge: bool) -> np.ndarray:
+        bridges_first_half = utils.generate_valid_bridges(
+            bridge_params_dict[num_genes], 
+            bridge_params_dict[genes].start_range, 
+            bridge_params_dict[genes].start_range, 
+            bridge_params_dict[genes].sigma_range, 
+            bridge_params_dict[genes].upregulation_bridge)
+        bridges_endpoints_first_half = [bridge[-51] for bridge in bridges_first_half]
+        number_of_bridges = len(bridges_endpoints_first_half)
+        bridges_second_half = []
+        for i in range(number_of_bridges):
+            start_range_value = bridges_endpoints_first_half[i]
+            bridges_second_half = utils.generate_valid_bridges(
+                bridge_params_dict[num_genes], 
+                start_range=(start_range_value, start_range_value), 
+                end_range=bridge_params_dict[genes].end_range, 
+                sigma_range=bridge_params_dict[genes].sigma_range, 
+                upregulation_bridge=upregulation_bridge
+            )
+            bridges_second_half.append(bridges_second_half[0])
+        combined_bridges = utils.combine_bridges(bridges_first_half, bridges_second_half)
+        return combined_bridges
+
+def adjust_means_by_phase(
+    phase: str,
+    full_obs: Dict[str, pd.DataFrame],
+    transformed_means: Dict[str, pd.DataFrame],
+    marker_genes: pd.DataFrame,
+    S_bridges: np.ndarray,
+    G2M_bridges: np.ndarray,
+    identity_bridges: np.ndarray
+) -> Dict[str, pd.DataFrame]:
+    """Adjust the mean expression of the genes for each cell in the given phase.
+    The adjustment is done by extracting upregulation factors from bridges (create_facs_per_cell()) and multiplying them with original gene means.
+
+    Args:
+    phase (str): The current phase of the cell cycle.
+    full_obs (Dict[str, pd.DataFrame]): The DataFrame containing the cells.
+    transformed_means (Dict[str, pd.DataFrame]): The DataFrame containing the mean expression of the genes for each cell.
+    marker_genes (DataFrame): The DataFrame containing all genes.
+    S_bridges (ndarray): The bridges for the S phase.
+    G2M_bridges (ndarray): The bridges for the G2M phase.
+    identity_bridges (ndarray): The bridges for the identity phase.
+
+    Returns:
+    Dict[str, pd.DataFrame]: The DataFrame containing the mean expression of the genes for each cell after the adjustment.
+    """
+    
+    phase_transf_means = {pat: [] for pat in full_obs}
+
+    for patient in full_obs:
+        df_obs = full_obs[patient].copy()
+        mask_cells = (df_obs['cell_phase'] == phase).values
+        new_means = transformed_means[patient].copy()
+        cell_means = new_means[mask_cells]
+
+        df_obs = df_obs[mask_cells]
+
+        adjusted_cell_means = np.zeros_like(cell_means)
+        for i in range(cell_means.shape[0]):
+            common_random_index, cell_factors = create_facs_per_cell(marker_genes, S_bridges, G2M_bridges, identity_bridges)
+            adjusted_cell_means[i, :] = cell_means[i, :] * cell_factors.T
+
+            # Save the cell position for the next step: library size transformation
+            cell_position_x = common_random_index / 100
+            df_obs.iloc[i].cell_position_x = cell_position_x
+
+        full_obs[patient][mask_cells] = df_obs
+
+        new_means[mask_cells] = adjusted_cell_means
+        phase_transf_means[patient] = new_means
+
+    return phase_transf_means
+
+def create_facs_per_cell(marker_genes: pd.DataFrame, S_bridges: np.ndarray, G2M_bridges: np.ndarray, identity_bridges: np.ndarray) -> Tuple[int, pd.DataFrame]:
+    """Extract upregulation factors from bridges and assign them to the corresponding genes.
+    The factors are then used to adjust the mean expression of the genes.
+    
+    Args:
+    marker_genes (DataFrame): The DataFrame containing genes.
+    S_bridges (ndarray): The bridges for the S phase.
+    G2M_bridges (ndarray): The bridges for the G2M phase.
+    identity_bridges (ndarray): The bridges for the identity phase.
+    
+    Returns:
+    int: The common random index used to identify the position of the cell in the bridge/phase.
+    DataFrame: The DataFrame containing the upregulation factors for each gene.
+    """
+
+    condition_s_genes = (marker_genes.S == 1)
+    condition_g2m_genes = (marker_genes.G2M == 1)
+    condition_identity_genes = ((marker_genes.S == 0) & (marker_genes.G2M == 0))
+
+    mask_s_genes = (condition_s_genes).ravel()
+    mask_g2m_genes = (condition_g2m_genes).ravel()
+    mask_identity_genes = (condition_identity_genes).ravel()
+
+    facs_per_cell = marker_genes[['S']].copy()
+
+    common_random_index = np.random.randint(0, len(S_bridges[0])) # lenght of all bridges is the same = 100
+
+    values_from_s_bridges = utils.extract_values_from_bridges(S_bridges, common_random_index)
+    values_from_g2m_bridges = utils.extract_values_from_bridges(G2M_bridges, common_random_index)
+    values_from_identity_bridges = utils.extract_values_from_bridges(identity_bridges, common_random_index)
+
+    facs_per_cell['S'] = facs_per_cell['S'].astype(float)
+    facs_per_cell.loc[mask_s_genes, 'S'] = values_from_s_bridges
+    facs_per_cell.loc[mask_g2m_genes, 'S'] = values_from_g2m_bridges
+    facs_per_cell.loc[mask_identity_genes, 'S'] = values_from_identity_bridges
+
+    return common_random_index, facs_per_cell
+
+######### Adjusting library size linked to phase ############
+def transform_library_size(
+    phase: str,
+    full_obs: Dict[str, pd.DataFrame],
+    transformed_means: Dict[str, pd.DataFrame],
+    cell_cycle_proportions: Proportions,
+    coefficient_cache: CoefficientCache
+) -> Dict[str, pd.DataFrame]:
+    
+    phase_transf_means = {pat: [] for pat in full_obs}
+
+    phase_transf_means = adjust_library_size_by_phase(
+        phase, 
+        full_obs, 
+        transformed_means, 
+        cell_cycle_proportions,
+        coefficient_cache 
+    )
+
+    return phase_transf_means
+
+def adjust_library_size_by_phase(
+    phase: str,
+    full_obs: Dict[str, pd.DataFrame],
+    transformed_means: Dict[str, pd.DataFrame],
+    cell_cycle_proportions: Proportions,
+    coefficient_cache: CoefficientCache
+) -> Dict[str, pd.DataFrame]:
+    
+    phase_transf_means = {pat: [] for pat in full_obs}
+
+    for patient in full_obs:
+        df_obs = full_obs[patient].copy()
+        mask_cells = (df_obs['cell_phase'] == phase).values
+        new_means = transformed_means[patient].copy()
+        cell_means = new_means[mask_cells]
+
+        df_obs = df_obs[mask_cells]
+
+        for i in range(cell_means.shape[0]):
+            original_proportions = cell_cycle_proportions.get_proportion(df_obs.iloc[i].program)
+            adjusted_cell_position_x, G1, S, G2M = adjust_common_random_index(phase, df_obs.iloc[i].cell_position_x, original_proportions)
+
+            df_obs.iloc[i].cell_position_x = adjusted_cell_position_x
+            df_obs.iloc[i].cell_position_y = get_factor_for_new_library_size(adjusted_cell_position_x, G1, coefficient_cache)
+            
+        dfs_obs_cell_position_y = df_obs.cell_position_y.values
+        cell_position_y_column = dfs_obs_cell_position_y.astype(float).reshape(-1, 1)
+        cell_means *= cell_position_y_column
+
+        full_obs[patient][mask_cells] = df_obs
+
+        new_means[mask_cells] = cell_means
+        phase_transf_means[patient] = new_means
+
+    return phase_transf_means
+
+def adjust_common_random_index(phase: str, common_random_index: int, original_proportions: dict) -> Tuple[int, Tuple[int, float], Tuple[int, float], Tuple[int, float]]:
+    """
+    Adjust the cell cycle proportions by excluding the G0 phase and redistributing its proportion among the other phases.
+    Adjust the exact position of the cell within the phase (common_random_index) after the redistribution of the cell cycle proportions.
+    
+    Args:
+    phase (str): The current phase of the cell cycle.
+    common_random_index (int): The position of the cell within the phase.
+    original_proportions (dict): The original proportions of the cell cycle phases.
+    
+    Returns:
+    int: The adjusted position of the cell within the phase.
+    Tuple[int, float]: The range of the G1 phase.
+    Tuple[int, float]: The range of the S phase.
+    Tuple[int, float]: The range of the G2M phase.
+    """
+
+    remaining_total = sum(value for phase, value in original_proportions.items() if phase != 'G0')
+    adjusted_proportions = {phase: value / remaining_total for phase, value in original_proportions.items() if phase != 'G0'}
+
+    G1 = (0, adjusted_proportions.get('G1'))
+    S = (G1[1], G1[1] + adjusted_proportions.get('S'))
+    G2M = (S[1], S[1] + adjusted_proportions.get('G2M'))
+
+    if phase == 'G1':
+        common_random_index = G1[0] + (G1[1] - G1[0]) * common_random_index
+    elif phase == 'S':
+        common_random_index = S[0] + (S[1] - S[0]) * common_random_index
+    elif phase == 'G2M':
+        common_random_index = G2M[0] + (G2M[1] - G2M[0]) * common_random_index
+
+    return common_random_index, G1, S, G2M
+
+def get_factor_for_new_library_size(common_random_index: int, G1: Tuple[int, float], coefficient_cache: CoefficientCache) -> float:
+    G1_bottom = G1[1] / 2
+    points1 = [(0, 2), (G1_bottom, 1), (G1[1], 2)]
+    points2 = [(G1_bottom - (1 - G1_bottom), 2), (G1_bottom, 1), (1, 2)]
+
+    coefficients_1, coefficients_2 = coefficient_cache.recalculate_coefficients(points1, points2)
+    a, b, c = symbols('a b c')
+
+    def quadratic_function_1(x):
+        return coefficients_1[a] * x**2 + coefficients_1[b] * x + coefficients_1[c]
+
+    def quadratic_function_2(x):
+        return coefficients_2[a] * x**2 + coefficients_2[b] * x + coefficients_2[c]
+    
+    if common_random_index < G1_bottom:
+        return quadratic_function_1(common_random_index)
+    elif common_random_index > G1_bottom:
+        return quadratic_function_2(common_random_index)
+    else:
+        return 1

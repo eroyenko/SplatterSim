@@ -12,6 +12,8 @@ from simul.patients.dataset import Dataset
 from simul.cnv.sampling import ProgramDistribution
 import simul.patients.create_dataset as ds
 
+from sympy import symbols, Eq, solve
+from simul.base.config import CoefficientCache
 
 def simulate_full_obs(
     dataset: Dataset, prob_dist: ProgramDistribution, p_drop: Union[List[float], np.ndarray, float] = 0.3
@@ -47,9 +49,10 @@ def get_common_mean_pc(
     return mean_pp
 
 
-def get_group_cnv_transformed(
+def get_group_cnv_cycle_transformed(
     mean_pp: np.ndarray,
     full_obs: Dict[str, np.ndarray],
+    marker_genes: pd.DataFrame,
     config: SimCellConfig,
     dataset: Dataset,
     rng: np.random.Generator,
@@ -73,6 +76,18 @@ def get_group_cnv_transformed(
         full_obs=full_obs, transformed_means=transformed_means, dataset=dataset, shared_cnv=config.shared_cnv
     )
 
+    if config.transform_means_cell_cycle:
+        print("Assigning each cell a cycle phase according to given proportions...")
+        full_obs = ds.set_up_full_obs(full_obs)
+        full_obs = utils.assign_cycle_phases(
+            config=config, full_obs=full_obs,
+        )
+    
+        phases = ['G1', 'S', 'G2M']
+        for phase in phases:
+            print(f"Transforming mean linked to {phase} phase...")
+            transformed_means = utils.transform_phase_means(phase, full_obs, marker_genes, transformed_means, config.bridge_params)
+
     return transformed_means, de_facs_groups, de_facs_be, gain_expr_full, loss_expr_full
 
 
@@ -86,7 +101,6 @@ def adjust_libsize(
     print("Adjusting for library size...")
     libsize_means = splatter.libsize_adjusted_means(means=transformed_means, libsize=pat_libsize)
     return libsize_means
-
 
 def sample_counts_patient(mean_pc: np.ndarray, config: SimCellConfig, rng: np.random.Generator) -> np.ndarray:
 
@@ -114,16 +128,27 @@ def sample_counts_patient(mean_pc: np.ndarray, config: SimCellConfig, rng: np.ra
 
 
 def simulate_dataset(
-    config: SimCellConfig, rng: np.random.Generator, full_obs: Dict[str, pd.DataFrame], dataset: Dataset
+    config: SimCellConfig, rng: np.random.Generator, full_obs: Dict[str, pd.DataFrame], marker_genes: pd.DataFrame, dataset: Dataset
 ) -> Tuple[Dict[str, np.ndarray]]:
     mean_pp = get_common_mean_pc(config=config, full_obs=full_obs, rng=rng)
-    transformed_means, de_facs_group, de_facs_be, gain_expr_full, loss_expr_full = get_group_cnv_transformed(
-        mean_pp=mean_pp, full_obs=full_obs, config=config, dataset=dataset, rng=rng
+    transformed_means, de_facs_group, de_facs_be, gain_expr_full, loss_expr_full = get_group_cnv_cycle_transformed(
+        mean_pp=mean_pp, full_obs=full_obs, marker_genes=marker_genes, config=config, dataset=dataset, rng=rng
     )
+
     transformed_means = adjust_libsize(rng=rng, transformed_means=transformed_means, config=config)
+
+    if config.transform_means_cell_cycle & config.adjust_lib_size_cell_cycle:
+        coefficient_cache = CoefficientCache()
+        phases = ['G1', 'S', 'G2M']
+        for phase in phases:
+            print(f"Adjusting library size linked to {phase} phase...")
+            transformed_means = utils.transform_library_size(phase, full_obs, transformed_means, config.cell_cycle_proportions, coefficient_cache)
+
     final_counts_pp = {}
     for pat in transformed_means:
         final_counts_pp[pat] = sample_counts_patient(mean_pc=transformed_means[pat], config=config, rng=rng)
+
+    ds.clean_up_full_obs(full_obs)
 
     return final_counts_pp, de_facs_group, de_facs_be, gain_expr_full, loss_expr_full
 
@@ -140,3 +165,33 @@ def counts_to_adata(
 
         adatas.append(ad.AnnData(counts_pp[pat], obs=obs, var=var, dtype=counts_pp[pat].dtype))
     return adatas
+
+
+def create_marker_genes(adatavar: pd.DataFrame, num_s_markers: int, num_g2m_markers: int) -> pd.DataFrame:
+    """Create marker genes for S and G2M phase. Marker genes are chosen randomly from the given list.
+    Two genes cannot be markers for both S and G2M phase.
+
+    Parameters:
+    adatavar (DataFrame): The DataFrame containing genes.
+    num_s_markers (int): The number of S markers genes to create.
+    num_g2m_markers (int): The number of G2M marker genes to create.
+
+    Returns:
+    DataFrame: A DataFrame containing 1 in column S if a gene is a marker gene for S phase, 
+    1 in column G2M if a gene is a marker gene for G2M phase, 0 otherwise.
+    """
+
+    s_column = np.zeros(adatavar.shape[0], dtype=int)
+    g2m_column = np.zeros(adatavar.shape[0], dtype=int)
+    
+    total_indices = np.random.choice(adatavar.shape[0], num_s_markers + num_g2m_markers, replace=False)
+    
+    s_indices = total_indices[:num_s_markers]
+    g2m_indices = total_indices[num_s_markers:num_s_markers + num_g2m_markers]
+    
+    s_column[s_indices] = 1
+    g2m_column[g2m_indices] = 1
+    
+    marker_genes = pd.DataFrame({'S': s_column, 'G2M': g2m_column}, index=adatavar.index)
+    
+    return marker_genes

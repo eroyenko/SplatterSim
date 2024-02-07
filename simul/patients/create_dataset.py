@@ -45,9 +45,10 @@ def simulate_malignant_comp_batches(dataset: Dataset, prob_dist: ProgramDistribu
                 )[0]
             )
         malignant = ["malignant"] * patient.n_malignant_cells
+        cell_phase = [pd.NA] * patient.n_malignant_cells
         df_obs = pd.DataFrame(
-            np.array([batch_clones, cell_programs, malignant]),
-            index=["subclone", "program", "malignant_key"],
+            np.array([batch_clones, cell_programs, malignant, cell_phase]),
+            index=["subclone", "program", "malignant_key", "cell_phase"],
             columns=[f"cell{i+1}" for i in range(batch_clones.shape[0])],
         ).T
         all_malignant_obs[patient.batch] = df_obs
@@ -102,10 +103,11 @@ def simulate_healthy_comp_batches(dataset: Dataset) -> Dict[str, pd.DataFrame]:
         clones = ["NA"] * patient.n_healthy_cells
         cell_programs = [np.random.choice(["Macro", "Plasma"]) for _ in range(patient.n_healthy_cells)]
         malignant = ["non_malignant"] * patient.n_healthy_cells
+        cell_phase = [pd.NA] * patient.n_healthy_cells
 
         df_obs = pd.DataFrame(
-            np.array([clones, cell_programs, malignant]),
-            index=["subclone", "program", "malignant_key"],
+            np.array([clones, cell_programs, malignant, cell_phase]),
+            index=["subclone", "program", "malignant_key", "cell_phase"],
             columns=[f"cell{i+1+patient.n_malignant_cells}" for i in range(len(clones))],
         ).T
         all_healthy_obs[patient.batch] = df_obs
@@ -121,3 +123,20 @@ def get_full_obs(
     for pat in full_obs:
         full_obs[pat].index = [f"cell{i+1}" for i in range(full_obs[pat].shape[0])]
     return full_obs
+
+def set_up_full_obs(full_obs: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
+    for patient in full_obs:
+        df_obs = full_obs[patient].copy()
+        df_obs['cell_position_x'] = pd.NA
+        df_obs['cell_position_y'] = pd.NA
+        full_obs[patient] = df_obs
+
+    return full_obs
+
+def clean_up_full_obs(full_obs: Dict[str, pd.DataFrame]) -> Tuple[Dict[str, pd.DataFrame], Dict[str, pd.DataFrame]]:
+    full_obs_cell_position = {}
+    for patient, df in full_obs.items():
+        full_obs_cell_position[patient] = df[['cell_position_x', 'cell_position_y']].copy()
+        full_obs[patient] = df.drop(['cell_position_x', 'cell_position_y'], axis=1)
+
+    return full_obs, full_obs_cell_position
