@@ -5,7 +5,7 @@ from typing import Tuple, Dict, Union, List
 from sympy import symbols, Eq, solve
 
 class Proportions:
-    DEFAULT_PROPORTION = [0.10, 0.54, 0.20, 0.16]
+    DEFAULT_PROPORTION = [0.15, 0.54, 0.20, 0.11]
     PHASES = ["G0", "G1", "S", "G2M"]
 
     def __init__(self, celltypes, proportions):
